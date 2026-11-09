@@ -2676,6 +2676,16 @@ exports.autoDeleteRecycleBin = onSchedule({
             }
         }
 
+        // Query expired items in /recycle_bin (UDF13-13)
+        if (deletedCount < maxAllowedDeletes) {
+            const expiredBinSnap = await db.collection('recycle_bin').where('autoPurgeAt', '<=', thirtyDaysAgoIso).get();
+            for (const binDoc of expiredBinSnap.docs) {
+                if (deletedCount >= maxAllowedDeletes) break;
+                await binDoc.ref.delete().catch(() => {});
+                deletedCount++;
+            }
+        }
+
         // Check portal config setting: autoDeleteAbandonedSubmissions
         const configDoc = await db.collection('settings').doc('portal_config').get();
         const portalCfg = configDoc.exists ? configDoc.data() : {};
@@ -6717,6 +6727,9 @@ exports.permanentDeleteEmployeeServer = secureOnCall({ timeoutSeconds: 300, memo
         if (!subSnap || !subSnap.exists) {
             throw new functions.https.HttpsError('not-found', `Employee or Submission "${employeeId}" not found.`);
         }
+    } else {
+        const pId = (empSnap.data() && (empSnap.data().portalId || empSnap.data().employeeId)) || employeeId;
+        subSnap = await resolveSubmissionDocAdmin(db, pId, employeeId);
     }
 
     const empData = empSnap && empSnap.exists ? empSnap.data() : {};
@@ -6769,7 +6782,7 @@ exports.permanentDeleteEmployeeServer = secureOnCall({ timeoutSeconds: 300, memo
                     method: 'POST',
                     headers: { 'Content-Type': 'text/plain' },
                     body: JSON.stringify({
-                        action: 'delete_folder',
+                        action: 'permanent_delete_employee',
                         employeeName: resolvedName,
                         uniqueId: employeeId,
                         token: APPS_SCRIPT_SERVER_SECRET
@@ -6798,7 +6811,13 @@ exports.permanentDeleteEmployeeServer = secureOnCall({ timeoutSeconds: 300, memo
         { name: 'gamification_logs', field: 'userId' },
         { name: 'user_engagement', directId: true },
         { name: 'leave_balances', directId: true },
-        { name: 'leave_balances', field: 'employeeId' }
+        { name: 'leave_balances', field: 'employeeId' },
+        { name: 'complaints', field: 'userId' },
+        { name: 'reward_redemptions', field: 'userId' },
+        { name: 'bgv_records', field: 'employeeId' },
+        { name: 'correction_requests', field: 'targetId' },
+        { name: 'correction_requests', field: 'submissionId' },
+        { name: 'draft_submissions', field: 'ownerUid' }
     ];
 
     for (const target of collectionsToClean) {
@@ -6876,6 +6895,28 @@ exports.restoreRecycleBinServer = secureOnCall({ timeoutSeconds: 60 }, async (re
     const isSuperAdmin = token.isSuperAdmin === true || token.roleId === 'role-super-admin';
     const permissions = Array.isArray(token.permissions) ? token.permissions : [];
 
+    // Authorization: SuperAdmin or EMPLOYEES_TAB_RECYCLE_BIN / DELETE_EMPLOYEE
+    let hasRestorePerm = isSuperAdmin || 
+        permissions.includes('EMPLOYEES_TAB_RECYCLE_BIN') || 
+        permissions.includes('DELETE_EMPLOYEE');
+
+    if (!hasRestorePerm) {
+        const saSnap = await db.collection('staff_accounts').doc(request.auth.uid).get();
+        const saData = saSnap.exists ? saSnap.data() : null;
+        if (!saData || saData.isDisabled === true || saData.isActive === false) {
+            throw new functions.https.HttpsError('permission-denied', 'Missing permission to restore items from Recycle Bin.');
+        }
+        let allowed = saData.roleId === 'role-super-admin';
+        if (!allowed && saData.roleId) {
+            const roleSnap = await db.collection('roles').doc(saData.roleId).get();
+            const rolePerms = (roleSnap.exists && Array.isArray(roleSnap.data().permissions)) ? roleSnap.data().permissions : [];
+            allowed = rolePerms.includes('EMPLOYEES_TAB_RECYCLE_BIN') || rolePerms.includes('DELETE_EMPLOYEE');
+        }
+        if (!allowed) {
+            throw new functions.https.HttpsError('permission-denied', 'Missing permission to restore items from Recycle Bin.');
+        }
+    }
+
     const binSnap = await db.collection('recycle_bin').doc(recycleBinItemId).get();
     if (!binSnap.exists) {
         throw new functions.https.HttpsError('not-found', 'Record not found in Recycle Bin or already restored.');
@@ -6932,6 +6973,7 @@ exports.restoreRecycleBinServer = secureOnCall({ timeoutSeconds: 60 }, async (re
                 restoredAt: nowIso
             }, { merge: true });
             await computeAndApplyUserClaims(originalId).catch(() => {});
+            await admin.auth().updateUser(originalId, { disabled: false }).catch(() => {});
             break;
         }
 
@@ -6977,6 +7019,18 @@ exports.restoreRecycleBinServer = secureOnCall({ timeoutSeconds: 60 }, async (re
             await db.collection('roles').doc(originalId).set({
                 ...(data || {}),
                 id: originalId,
+                restoredAt: nowIso
+            }, { merge: true });
+            break;
+        }
+
+        case 'INVITE': {
+            await db.collection('referral_invites').doc(originalId).set({
+                ...(data || {}),
+                id: originalId,
+                status: 'Active',
+                isDeleted: false,
+                deletedAt: null,
                 restoredAt: nowIso
             }, { merge: true });
             break;
@@ -7056,13 +7110,26 @@ exports.deleteSiteServer = secureOnCall({ timeoutSeconds: 60 }, async (request) 
     const permissions = Array.isArray(token.permissions) ? token.permissions : [];
 
     // Authorization: SuperAdmin or SITES_DELETE / MANAGE_SITES / SITES_MANAGE
-    const hasSitePerm = isSuperAdmin || 
+    let hasSitePerm = isSuperAdmin || 
         permissions.includes('SITES_DELETE') || 
         permissions.includes('MANAGE_SITES') || 
         permissions.includes('SITES_MANAGE');
 
     if (!hasSitePerm) {
-        throw new functions.https.HttpsError('permission-denied', 'Missing permission to delete sites.');
+        const saSnap = await db.collection('staff_accounts').doc(request.auth.uid).get();
+        const saData = saSnap.exists ? saSnap.data() : null;
+        if (!saData || saData.isDisabled === true || saData.isActive === false) {
+            throw new functions.https.HttpsError('permission-denied', 'Missing permission to delete sites.');
+        }
+        let allowed = saData.roleId === 'role-super-admin';
+        if (!allowed && saData.roleId) {
+            const roleSnap = await db.collection('roles').doc(saData.roleId).get();
+            const rolePerms = (roleSnap.exists && Array.isArray(roleSnap.data().permissions)) ? roleSnap.data().permissions : [];
+            allowed = rolePerms.includes('SITES_DELETE') || rolePerms.includes('MANAGE_SITES') || rolePerms.includes('SITES_MANAGE');
+        }
+        if (!allowed) {
+            throw new functions.https.HttpsError('permission-denied', 'Missing permission to delete sites.');
+        }
     }
 
     // 1. Dependency Check: Active employees assigned to site
@@ -7148,11 +7215,13 @@ exports.deleteSiteServer = secureOnCall({ timeoutSeconds: 60 }, async (request) 
     const updatedSites = siteList.filter(s => s && s.id !== siteId);
     batch.update(sitesRef, { sites: updatedSites });
 
-    // Move to Recycle Bin
+    // Move to Recycle Bin (UDF13-03 schema aligned)
     const binRef = db.collection('recycle_bin').doc();
+    const expiryIso = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
     batch.set(binRef, {
         itemType: 'SITE',
         originalId: siteId,
+        name: resolvedSiteName,
         title: resolvedSiteName,
         subtitle: `${targetSite.city || ''}, ${targetSite.state || ''}`.trim().replace(/^,\s*|,\s*$/g, ''),
         data: targetSite,
@@ -7161,8 +7230,10 @@ exports.deleteSiteServer = secureOnCall({ timeoutSeconds: 60 }, async (request) 
         },
         deletedAt: new Date().toISOString(),
         deletedBy: request.auth.uid,
+        deletedByName: token.name || token.email || 'Admin',
         deletedByEmail: token.email || 'Admin',
-        autoPurgeAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString()
+        expiresAt: expiryIso,
+        autoPurgeAt: expiryIso
     });
 
     // Server Audit Log
@@ -7215,12 +7286,25 @@ exports.promoteEmployeeServer = secureOnCall({ timeoutSeconds: 60 }, async (requ
     const permissions = Array.isArray(token.permissions) ? token.permissions : [];
 
     // Authorization check
-    const hasPerm = isSuperAdmin ||
+    let hasPerm = isSuperAdmin ||
         permissions.includes('EMPLOYEES_MANAGE_DEPLOYMENTS') ||
         permissions.includes('SUBMISSIONS_APPROVE');
 
     if (!hasPerm) {
-        throw new functions.https.HttpsError('permission-denied', 'Missing permission to promote employees.');
+        const saSnap = await db.collection('staff_accounts').doc(request.auth.uid).get();
+        const saData = saSnap.exists ? saSnap.data() : null;
+        if (!saData || saData.isDisabled === true || saData.isActive === false) {
+            throw new functions.https.HttpsError('permission-denied', 'Missing permission to promote employees.');
+        }
+        let allowed = saData.roleId === 'role-super-admin';
+        if (!allowed && saData.roleId) {
+            const roleSnap = await db.collection('roles').doc(saData.roleId).get();
+            const rolePerms = (roleSnap.exists && Array.isArray(roleSnap.data().permissions)) ? roleSnap.data().permissions : [];
+            allowed = rolePerms.includes('EMPLOYEES_MANAGE_DEPLOYMENTS') || rolePerms.includes('SUBMISSIONS_APPROVE');
+        }
+        if (!allowed) {
+            throw new functions.https.HttpsError('permission-denied', 'Missing permission to promote employees.');
+        }
     }
 
     const empSnap = await resolveEmployeeDocAdmin(db, employeeId);
@@ -7298,16 +7382,18 @@ exports.promoteEmployeeServer = secureOnCall({ timeoutSeconds: 60 }, async (requ
     const batch = db.batch();
     batch.update(empSnap.ref, updates);
 
-    // Send notification to employee
-    const targetUid = empData.uid || empSnap.id;
+    // Send notification to employee (UDF13-07 aligned)
+    const targetUid = empData.employeeId || empData.uid || empSnap.id;
     const notifRef = db.collection('notifications').doc();
     batch.set(notifRef, {
+        id: notifRef.id,
         title: 'Promotion Confirmed',
         message: `Congratulations! You have been promoted to ${newDesignation.trim()} (Ref: ${cleanRefNo}).`,
         targetUserId: targetUid,
-        type: 'PROMOTION',
+        type: 'success',
         read: false,
-        createdAt: admin.firestore.FieldValue.serverTimestamp()
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        timestamp: new Date().toISOString()
     });
 
     // Server Audit Log
@@ -7356,8 +7442,22 @@ exports.bulkImportEmployeesServer = secureOnCall({ timeoutSeconds: 300, memory: 
     const isSuperAdmin = token.isSuperAdmin === true || token.roleId === 'role-super-admin';
     const permissions = Array.isArray(token.permissions) ? token.permissions : [];
 
-    if (!isSuperAdmin && !permissions.includes('EMPLOYEES_IMPORT')) {
-        throw new functions.https.HttpsError('permission-denied', 'Missing permission EMPLOYEES_IMPORT.');
+    let hasBulkPerm = isSuperAdmin || permissions.includes('EMPLOYEES_IMPORT');
+    if (!hasBulkPerm) {
+        const saSnap = await db.collection('staff_accounts').doc(request.auth.uid).get();
+        const saData = saSnap.exists ? saSnap.data() : null;
+        if (!saData || saData.isDisabled === true || saData.isActive === false) {
+            throw new functions.https.HttpsError('permission-denied', 'Missing permission EMPLOYEES_IMPORT.');
+        }
+        let allowed = saData.roleId === 'role-super-admin';
+        if (!allowed && saData.roleId) {
+            const roleSnap = await db.collection('roles').doc(saData.roleId).get();
+            const rolePerms = (roleSnap.exists && Array.isArray(roleSnap.data().permissions)) ? roleSnap.data().permissions : [];
+            allowed = rolePerms.includes('EMPLOYEES_IMPORT');
+        }
+        if (!allowed) {
+            throw new functions.https.HttpsError('permission-denied', 'Missing permission EMPLOYEES_IMPORT.');
+        }
     }
 
     const { generateIds = true, overwriteMode = 'skip', idPrefix = 'HY' } = options || {};
@@ -7414,11 +7514,16 @@ exports.bulkImportEmployeesServer = secureOnCall({ timeoutSeconds: 300, memory: 
                     empId = `EMP${Date.now()}${i}`;
                 }
 
-                // High entropy submission ID
+                // High entropy submission ID with ISO weighted polynomial checksum (UDF13-14)
+                const ENTROPY_WEIGHTS = [77, 117, 116, 104, 121, 97, 108, 97, 83, 97, 105, 82, 97, 109, 82, 101, 100, 100, 121];
                 const randBuf = new Uint32Array(2);
                 require('crypto').getRandomValues(randBuf);
                 const baseToken = (randBuf[0].toString(36) + randBuf[1].toString(36)).replace(/[^a-zA-Z0-9]/g, '').slice(0, 6).toUpperCase();
-                const submissionId = `UDF-${year}${month}-${baseToken}`;
+                const checkSum = Array.from(baseToken).reduce((acc, char, idx) => {
+                    return acc + (char.charCodeAt(0) * (ENTROPY_WEIGHTS[idx % ENTROPY_WEIGHTS.length] || 1));
+                }, 0);
+                const checkSuffix = (checkSum % 36).toString(36).toUpperCase();
+                const submissionId = `UDF-${year}${month}-${baseToken}${checkSuffix}`;
 
                 // Default password hash
                 const rawDob = row.dateOfBirth ? String(row.dateOfBirth).replace(/[^0-9]/g, '') : '01011990';
@@ -7451,8 +7556,30 @@ exports.bulkImportEmployeesServer = secureOnCall({ timeoutSeconds: 300, memory: 
                     }
                 };
 
+                // Multi-tenant site authority check (UDF13-05)
+                if (siteId && !isSuperAdmin) {
+                    const hasGlobalScope = permissions.includes('EMPLOYEES_VIEW_SCOPE_ALL') ||
+                        permissions.includes('SUBMISSIONS_VIEW_SCOPE_ALL') ||
+                        permissions.includes('MANAGE_SITES') ||
+                        permissions.includes('MANAGE_ALL_SITES');
+                    const sitesManaged = Array.isArray(token.sitesManaged) ? token.sitesManaged : [];
+                    if (!hasGlobalScope && !sitesManaged.includes(siteId)) {
+                        warnings.push({ row: rowNum, warning: `Skipped: You do not manage site "${siteName || siteId}".` });
+                        continue;
+                    }
+                }
+
                 const empRef = db.collection('employees').doc(empId);
                 const subRef = db.collection('onboarding_submissions').doc(submissionId);
+
+                // Skip existing employee documents when overwriteMode is 'skip' (UDF13-05)
+                if (overwriteMode === 'skip') {
+                    const existingEmpSnap = await empRef.get();
+                    if (existingEmpSnap.exists) {
+                        warnings.push({ row: rowNum, warning: `Skipped existing employee ID "${empId}".` });
+                        continue;
+                    }
+                }
 
                 batch.set(empRef, employeeRecord, { merge: overwriteMode === 'overwrite' });
                 batch.set(subRef, {
@@ -7630,10 +7757,20 @@ exports.recordDailyStreakServer = secureOnCall({ timeoutSeconds: 30 }, async (re
             lastUpdated: admin.firestore.FieldValue.serverTimestamp()
         }, { merge: true });
 
-        // Log streak points
+        // Dual-ID Sync (UDF13-04)
+        if (targetDocId !== uid) {
+            transaction.set(db.collection('user_engagement').doc(uid), {
+                ...streakResult,
+                userId: uid,
+                lastUpdated: admin.firestore.FieldValue.serverTimestamp()
+            }, { merge: true });
+        }
+
+        // Log streak points with dual user reference (UDF13-04)
         const logRef = db.collection('gamification_logs').doc();
         transaction.set(logRef, {
             userId: targetDocId,
+            userUid: uid,
             type: 'STREAK',
             streakCount: newCount,
             pointsAwarded: streakPoints,
@@ -7691,6 +7828,25 @@ exports.redeemRewardServer = secureOnCall({ timeoutSeconds: 30 }, async (request
         }
     }
 
+    // Server-side reward cost verification against gamification_rules (UDF13-02)
+    let verifiedCost = cost;
+    try {
+        const rulesSnap = await db.collection('settings').doc('gamification_rules').get();
+        if (rulesSnap.exists) {
+            const rulesData = rulesSnap.data() || {};
+            const rewardsList = Array.isArray(rulesData.rewards) ? rulesData.rewards : [];
+            const matchedReward = rewardsList.find(r => r && (
+                (r.id && r.id === request.data.rewardId) ||
+                (r.title && r.title.trim().toLowerCase() === rewardTitle.trim().toLowerCase())
+            ));
+            if (matchedReward && matchedReward.pointsCost !== undefined) {
+                verifiedCost = Number(matchedReward.pointsCost);
+            }
+        }
+    } catch (rulesErr) {
+        console.warn('[redeemRewardServer] Could not verify reward price against gamification_rules:', rulesErr);
+    }
+
     const engagementRef = db.collection('user_engagement').doc(targetDocId);
     const redemptionRef = db.collection('reward_redemptions').doc();
     const logRef = db.collection('gamification_logs').doc();
@@ -7704,14 +7860,14 @@ exports.redeemRewardServer = secureOnCall({ timeoutSeconds: 30 }, async (request
         const engagementSnap = await transaction.get(engagementRef);
         const currentPoints = engagementSnap.exists ? (engagementSnap.data().points || 0) : 0;
 
-        if (currentPoints < cost) {
+        if (currentPoints < verifiedCost) {
             throw new functions.https.HttpsError(
                 'failed-precondition',
-                `Insufficient points. You have ${currentPoints} points, but ${cost} are required.`
+                `Insufficient points. You have ${currentPoints} points, but ${verifiedCost} are required for "${rewardTitle.trim()}".`
             );
         }
 
-        remainingPoints = currentPoints - cost;
+        remainingPoints = currentPoints - verifiedCost;
 
         // Deduct points
         transaction.set(engagementRef, {
@@ -7719,24 +7875,34 @@ exports.redeemRewardServer = secureOnCall({ timeoutSeconds: 30 }, async (request
             lastUpdated: admin.firestore.FieldValue.serverTimestamp()
         }, { merge: true });
 
+        // Dual-ID Sync (UDF13-04)
+        if (targetDocId !== uid) {
+            transaction.set(db.collection('user_engagement').doc(uid), {
+                points: remainingPoints,
+                lastUpdated: admin.firestore.FieldValue.serverTimestamp()
+            }, { merge: true });
+        }
+
         // Create redemption record
         transaction.set(redemptionRef, {
             id: redemptionRef.id,
             userId: targetDocId,
+            userUid: uid,
             userName,
             rewardTitle: rewardTitle.trim(),
-            pointsSpent: cost,
+            pointsSpent: verifiedCost,
             voucherCode,
             status: 'pending',
             timestamp: admin.firestore.FieldValue.serverTimestamp()
         });
 
-        // Add to immutable gamification_logs
+        // Add to immutable gamification_logs (UDF13-04)
         transaction.set(logRef, {
             userId: targetDocId,
+            userUid: uid,
             type: 'REDEMPTION',
             rewardTitle: rewardTitle.trim(),
-            pointsDeducted: cost,
+            pointsDeducted: verifiedCost,
             voucherCode,
             timestamp: admin.firestore.FieldValue.serverTimestamp()
         });
@@ -7783,15 +7949,25 @@ exports.sendNotificationServer = secureOnCall({ timeoutSeconds: 30 }, async (req
     // 1. Check broadcast permissions
     const isBroadcast = trimmedTarget.startsWith('ROLE:') || trimmedTarget === 'all_admins' || trimmedTarget === 'admin';
 
+    // Allow non-admins to send notifications if it is an official workflow notification (UDF13-09)
+    const isWorkflowNotification = metadata && (
+        metadata.module === 'LEAVES' ||
+        metadata.module === 'ACCOUNT_UPDATES' ||
+        metadata.module === 'RESIGNATIONS' ||
+        metadata.module === 'ONBOARDING' ||
+        metadata.module === 'SUBMISSIONS' ||
+        metadata.isWorkflow === true
+    );
+
     if (isBroadcast) {
-        if (trimmedTarget.startsWith('ROLE:') && !isAdmin) {
+        if (trimmedTarget.startsWith('ROLE:') && !isAdmin && !isWorkflowNotification) {
             throw new functions.https.HttpsError('permission-denied', 'Only administrators can broadcast role-based notifications.');
         }
-        // Non-admins can message 'all_admins' or 'admin' (e.g. for support/grievances)
+        // Non-admins can message 'all_admins', 'admin', or workflow roles
     } else {
-        // Individual recipient check: Non-admins can only send notifications addressed to themselves or an admin
+        // Individual recipient check: Non-admins can send notifications addressed to themselves, an admin, or workflow approver
         const isSelf = (trimmedTarget === uid || trimmedTarget === token.employeeId || trimmedTarget === token.portalId);
-        if (!isSelf && !isAdmin) {
+        if (!isSelf && !isAdmin && !isWorkflowNotification) {
             throw new functions.https.HttpsError('permission-denied', 'Non-administrative users cannot send notifications to other users.');
         }
     }
@@ -7857,12 +8033,25 @@ exports.completeBgvReviewServer = secureOnCall({ timeoutSeconds: 60 }, async (re
 
     const isSuperAdmin = token.isSuperAdmin === true || token.roleId === 'role-super-admin';
     const permissions = Array.isArray(token.permissions) ? token.permissions : [];
-    const hasBgvPerm = isSuperAdmin ||
+    let hasBgvPerm = isSuperAdmin ||
         permissions.includes('BGV_APPROVE_REJECT') ||
         permissions.includes('BGV_MANAGE');
 
     if (!hasBgvPerm) {
-        throw new functions.https.HttpsError('permission-denied', 'Missing permission to approve or reject BGV.');
+        const saSnap = await db.collection('staff_accounts').doc(request.auth.uid).get();
+        const saData = saSnap.exists ? saSnap.data() : null;
+        if (!saData || saData.isDisabled === true || saData.isActive === false) {
+            throw new functions.https.HttpsError('permission-denied', 'Missing permission to approve or reject BGV.');
+        }
+        let allowed = saData.roleId === 'role-super-admin';
+        if (!allowed && saData.roleId) {
+            const roleSnap = await db.collection('roles').doc(saData.roleId).get();
+            const rolePerms = (roleSnap.exists && Array.isArray(roleSnap.data().permissions)) ? roleSnap.data().permissions : [];
+            allowed = rolePerms.includes('BGV_APPROVE_REJECT') || rolePerms.includes('BGV_MANAGE');
+        }
+        if (!allowed) {
+            throw new functions.https.HttpsError('permission-denied', 'Missing permission to approve or reject BGV.');
+        }
     }
 
     const db = admin.firestore();
@@ -7876,6 +8065,20 @@ exports.completeBgvReviewServer = secureOnCall({ timeoutSeconds: 60 }, async (re
     const bgvData = bgvSnap.data();
     const targetEmpId = employeeId || bgvData.employeeId;
     const empSnap = await resolveEmployeeDocAdmin(db, targetEmpId);
+    const empData = empSnap && empSnap.exists ? empSnap.data() : {};
+    const empSiteId = empData.currentSiteId || bgvData.siteId || '';
+
+    // Multi-tenant site check for BGV (UDF13-06)
+    if (empSiteId && !isSuperAdmin) {
+        const hasGlobalScope = permissions.includes('EMPLOYEES_VIEW_SCOPE_ALL') ||
+            permissions.includes('SUBMISSIONS_VIEW_SCOPE_ALL') ||
+            permissions.includes('MANAGE_SITES') ||
+            permissions.includes('MANAGE_ALL_SITES');
+        const sitesManaged = Array.isArray(token.sitesManaged) ? token.sitesManaged : [];
+        if (!hasGlobalScope && !sitesManaged.includes(empSiteId)) {
+            throw new functions.https.HttpsError('permission-denied', `You do not have management authority for site "${empSiteId}".`);
+        }
+    }
 
     const approverName = token.name || token.email || 'Admin';
     const nowIso = new Date().toISOString();

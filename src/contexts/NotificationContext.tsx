@@ -32,6 +32,12 @@ export const NotificationProvider: React.FC<{ children: ReactNode }> = ({ childr
         if (user.type === UserType.ADMIN || user.isSuperAdmin || (user.type as string) === 'Staff' || (user as any).roleId) {
             targetIds.push('all_admins', 'admin');
         }
+        if ((user as any).roleId) {
+            const roleTarget = `ROLE:${(user as any).roleId}`;
+            if (!targetIds.includes(roleTarget)) {
+                targetIds.push(roleTarget);
+            }
+        }
         if (user.employeeId && !targetIds.includes(user.employeeId)) {
             targetIds.push(user.employeeId);
         }
@@ -85,7 +91,7 @@ export const NotificationProvider: React.FC<{ children: ReactNode }> = ({ childr
         return () => {
             unsubscribers.forEach(u => u());
         };
-    }, [user?.id, user?.type, user?.isSuperAdmin, user?.employeeId, user?.portalId]);
+    }, [user?.id, user?.type, user?.isSuperAdmin, user?.employeeId, user?.portalId, (user as any)?.roleId]);
 
     const sendNotification = useCallback(async (
         targetUserId: string,
@@ -104,8 +110,16 @@ export const NotificationProvider: React.FC<{ children: ReactNode }> = ({ childr
             link: (link || null) as any
         };
 
-        // Instant local update
-        setNotifications(prev => [newNotif, ...prev.filter(n => n.id !== notifId)]);
+        // Instant local update (only if target matches the active user session)
+        const isSelfOrBroadcast = targetUserId === user?.id || 
+            targetUserId === user?.employeeId || 
+            targetUserId === user?.portalId || 
+            (targetUserId === 'all_admins' && (user?.type === UserType.ADMIN || user?.isSuperAdmin || (user?.type as string) === 'Staff')) ||
+            (targetUserId === `ROLE:${(user as any)?.roleId}`);
+
+        if (isSelfOrBroadcast) {
+            setNotifications(prev => [newNotif, ...prev.filter(n => n.id !== notifId)]);
+        }
 
         // Persist via secure Cloud Function with fallback
         try {

@@ -112,8 +112,9 @@ const AdminRecycleBinPage: React.FC<AdminRecycleBinPageProps> = ({
       // Search Filter
       if (searchQuery.trim()) {
         const q = searchQuery.toLowerCase();
-        const matchesName = item.name.toLowerCase().includes(q);
-        const matchesDeleter = (item.deletedByName || '').toLowerCase().includes(q);
+        const itemName = (item.name || (item as any).title || '').toLowerCase();
+        const matchesName = itemName.includes(q);
+        const matchesDeleter = (item.deletedByName || (item as any).deletedByEmail || '').toLowerCase().includes(q);
         const matchesId = (item.originalId || '').toLowerCase().includes(q);
         if (!matchesName && !matchesDeleter && !matchesId) {
           return false;
@@ -334,14 +335,14 @@ const AdminRecycleBinPage: React.FC<AdminRecycleBinPageProps> = ({
               <tbody className="divide-y divide-gray-100 text-xs">
                 {filteredItems.map(item => {
                   const typeConf = TYPE_CONFIG[item.itemType] || TYPE_CONFIG.SITE;
-                  const daysLeft = getDaysRemaining(item.expiresAt);
+                  const daysLeft = getDaysRemaining(item.expiresAt || (item as any).autoPurgeAt);
                   const isRestoring = restoringId === item.id;
 
                   return (
                     <tr key={item.id} className="hover:bg-gray-50/60 transition-colors">
                       {/* Name & ID */}
                       <td className="py-3.5 px-4">
-                        <div className="font-bold text-gray-900">{item.name}</div>
+                        <div className="font-bold text-gray-900">{item.name || (item as any).title || 'Unnamed Item'}</div>
                         <div className="text-[11px] text-gray-400 font-mono mt-0.5">
                           ID: {item.originalId}
                         </div>

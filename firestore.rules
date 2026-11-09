@@ -573,9 +573,10 @@ service cloud.firestore {
       allow write: if isSuperAdmin() || hasPermission('MANAGE_SYSTEM');
     }
 
-    // ─── Central Recycle Bin (Soft Delete & Universal Undo Vault - Super Admin Only) ───────────
+    // ─── Central Recycle Bin (Soft Delete & Universal Undo Vault - Super Admin / Delegated HR) ───────────
     match /recycle_bin/{id} {
-      allow read, update, delete: if isSuperAdmin();
+      allow read: if isSuperAdmin() || hasPermission('EMPLOYEES_TAB_RECYCLE_BIN');
+      allow update, delete: if isSuperAdmin();
       // SEC-07: Non-superadmins cannot archive STAFF or ROLE documents to prevent Trojan privilege escalation
       allow create: if isSuperAdmin() || (isAdmin() && !request.resource.data.get('itemType', '').matches('(?i)(STAFF|ROLE)'));
     }

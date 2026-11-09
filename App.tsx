@@ -478,7 +478,12 @@ const App: React.FC = () => {
       }
       return true;
     });
-    targets.forEach(t => sendNotification(t.id, message, type, link));
+    if (targets.length > 0) {
+      targets.forEach(t => sendNotification(t.id, message, type, link));
+    } else {
+      // Fallback for employee/candidate sessions where staffUsers list is empty (UDF13-09)
+      sendNotification(`ROLE:${roleId}`, message, type, link);
+    }
   }, [staffUsers, sites, sendNotification]);
 
   // SMART NOTIFICATION HELPER
