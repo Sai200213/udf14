@@ -7496,3 +7496,483 @@ exports.bulkImportEmployeesServer = secureOnCall({ timeoutSeconds: 300, memory: 
     };
 });
 
+
+
+/**
+ * 6. recordDailyStreakServer
+ * Server-enforced daily attendance streak and point crediting strictly under Asia/Kolkata (IST).
+ * Prevents client-side date forgery, point inflation, and duplicate visits.
+ */
+exports.recordDailyStreakServer = secureOnCall({ timeoutSeconds: 30 }, async (request) => {
+    if (!request.auth) {
+        throw new functions.https.HttpsError('unauthenticated', 'Must be authenticated to record streak.');
+    }
+    const token = request.auth.token || {};
+    if (token.isDisabled === true) {
+        throw new functions.https.HttpsError('permission-denied', 'Account is disabled.');
+    }
+
+    const uid = request.auth.uid;
+    const db = admin.firestore();
+
+    // Determine target user document
+    let targetDocId = uid;
+    const requestedId = (request.data && typeof request.data.userId === 'string') ? request.data.userId.trim() : '';
+    const userName = (request.data && typeof request.data.userName === 'string') ? request.data.userName.trim() : (token.name || token.email || 'Employee');
+
+    if (requestedId && requestedId !== uid && !requestedId.includes('/')) {
+        if (token.employeeId === requestedId || token.portalId === requestedId || token.isSuperAdmin === true || token.isAdmin === true) {
+            targetDocId = requestedId;
+        } else {
+            const empCheck = await db.collection('employees').doc(requestedId).get();
+            if (empCheck.exists && (empCheck.data().uid === uid || empCheck.data().linkedUid === uid)) {
+                targetDocId = requestedId;
+            }
+        }
+    }
+
+    // Force date evaluation strictly under India Standard Time (IST = Asia/Kolkata)
+    const now = new Date();
+    const istString = now.toLocaleString("en-US", { timeZone: "Asia/Kolkata" });
+    const d = new Date(istString);
+    const year = d.getFullYear();
+    const month = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    const today = `${year}-${month}-${day}`;
+
+    const dYest = new Date(istString);
+    dYest.setDate(dYest.getDate() - 1);
+    const yYear = dYest.getFullYear();
+    const yMonth = String(dYest.getMonth() + 1).padStart(2, '0');
+    const yDay = String(dYest.getDate()).padStart(2, '0');
+    const yesterday = `${yYear}-${yMonth}-${yDay}`;
+
+    // Read streak points from gamification_rules
+    let streakPoints = 1;
+    try {
+        const rulesSnap = await db.collection('settings').doc('gamification_rules').get();
+        if (rulesSnap.exists) {
+            streakPoints = rulesSnap.data().streakPoints ?? 1;
+        }
+    } catch (e) {
+        console.warn('[recordDailyStreakServer] Failed to read gamification_rules:', e);
+    }
+
+    const engagementRef = db.collection('user_engagement').doc(targetDocId);
+    let streakResult = null;
+
+    await db.runTransaction(async (transaction) => {
+        const streakSnap = await transaction.get(engagementRef);
+
+        if (!streakSnap.exists) {
+            streakResult = {
+                userId: targetDocId,
+                userName,
+                streakCount: 1,
+                lastVisitDate: today,
+                points: streakPoints
+            };
+            transaction.set(engagementRef, {
+                ...streakResult,
+                createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                lastUpdated: admin.firestore.FieldValue.serverTimestamp()
+            });
+
+            // Log to gamification_logs
+            const logRef = db.collection('gamification_logs').doc();
+            transaction.set(logRef, {
+                userId: targetDocId,
+                type: 'STREAK',
+                streakCount: 1,
+                pointsAwarded: streakPoints,
+                date: today,
+                timestamp: admin.firestore.FieldValue.serverTimestamp()
+            });
+            return;
+        }
+
+        const data = streakSnap.data();
+        const lastVisit = data.lastVisitDate;
+        let newCount = data.streakCount || 0;
+        let currentPoints = data.points || 0;
+
+        if (lastVisit === today) {
+            // Already visited today — keep existing streak and points
+            streakResult = {
+                userId: targetDocId,
+                userName: data.userName || userName,
+                streakCount: newCount,
+                lastVisitDate: today,
+                points: currentPoints,
+                alreadyRecordedToday: true
+            };
+            return;
+        } else if (lastVisit === yesterday) {
+            // Consecutive visit
+            newCount += 1;
+            currentPoints += streakPoints;
+        } else {
+            // Broken streak, reset to 1
+            newCount = 1;
+            currentPoints += streakPoints;
+        }
+
+        streakResult = {
+            userId: targetDocId,
+            userName,
+            streakCount: newCount,
+            lastVisitDate: today,
+            points: currentPoints
+        };
+
+        transaction.set(engagementRef, {
+            ...streakResult,
+            lastUpdated: admin.firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
+
+        // Log streak points
+        const logRef = db.collection('gamification_logs').doc();
+        transaction.set(logRef, {
+            userId: targetDocId,
+            type: 'STREAK',
+            streakCount: newCount,
+            pointsAwarded: streakPoints,
+            date: today,
+            timestamp: admin.firestore.FieldValue.serverTimestamp()
+        });
+    });
+
+    return {
+        success: true,
+        streak: streakResult
+    };
+});
+
+/**
+ * 7. redeemRewardServer
+ * Atomic point verification and voucher generation for employee reward redemptions.
+ * Prevents race conditions, double-spending of points, and unauthorized voucher creation.
+ */
+exports.redeemRewardServer = secureOnCall({ timeoutSeconds: 30 }, async (request) => {
+    if (!request.auth) {
+        throw new functions.https.HttpsError('unauthenticated', 'Must be authenticated to redeem a reward.');
+    }
+    const token = request.auth.token || {};
+    if (token.isDisabled === true) {
+        throw new functions.https.HttpsError('permission-denied', 'Account is disabled.');
+    }
+
+    const uid = request.auth.uid;
+    const db = admin.firestore();
+
+    const { rewardTitle, pointsSpent } = request.data || {};
+    const cost = Number(pointsSpent);
+
+    if (!rewardTitle || typeof rewardTitle !== 'string' || !rewardTitle.trim()) {
+        throw new functions.https.HttpsError('invalid-argument', 'rewardTitle is required.');
+    }
+    if (isNaN(cost) || cost <= 0) {
+        throw new functions.https.HttpsError('invalid-argument', 'pointsSpent must be a positive number.');
+    }
+
+    // Determine target user document
+    let targetDocId = uid;
+    const requestedId = (request.data && typeof request.data.userId === 'string') ? request.data.userId.trim() : '';
+    const userName = (request.data && typeof request.data.userName === 'string') ? request.data.userName.trim() : (token.name || token.email || 'Employee');
+
+    if (requestedId && requestedId !== uid && !requestedId.includes('/')) {
+        if (token.employeeId === requestedId || token.portalId === requestedId || token.isSuperAdmin === true || token.isAdmin === true) {
+            targetDocId = requestedId;
+        } else {
+            const empCheck = await db.collection('employees').doc(requestedId).get();
+            if (empCheck.exists && (empCheck.data().uid === uid || empCheck.data().linkedUid === uid)) {
+                targetDocId = requestedId;
+            }
+        }
+    }
+
+    const engagementRef = db.collection('user_engagement').doc(targetDocId);
+    const redemptionRef = db.collection('reward_redemptions').doc();
+    const logRef = db.collection('gamification_logs').doc();
+
+    const randToken = Math.random().toString(36).substring(2, 7).toUpperCase();
+    const year = new Date().getFullYear();
+    const voucherCode = `UDF-RWD-${year}-${randToken}`;
+    let remainingPoints = 0;
+
+    await db.runTransaction(async (transaction) => {
+        const engagementSnap = await transaction.get(engagementRef);
+        const currentPoints = engagementSnap.exists ? (engagementSnap.data().points || 0) : 0;
+
+        if (currentPoints < cost) {
+            throw new functions.https.HttpsError(
+                'failed-precondition',
+                `Insufficient points. You have ${currentPoints} points, but ${cost} are required.`
+            );
+        }
+
+        remainingPoints = currentPoints - cost;
+
+        // Deduct points
+        transaction.set(engagementRef, {
+            points: remainingPoints,
+            lastUpdated: admin.firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
+
+        // Create redemption record
+        transaction.set(redemptionRef, {
+            id: redemptionRef.id,
+            userId: targetDocId,
+            userName,
+            rewardTitle: rewardTitle.trim(),
+            pointsSpent: cost,
+            voucherCode,
+            status: 'pending',
+            timestamp: admin.firestore.FieldValue.serverTimestamp()
+        });
+
+        // Add to immutable gamification_logs
+        transaction.set(logRef, {
+            userId: targetDocId,
+            type: 'REDEMPTION',
+            rewardTitle: rewardTitle.trim(),
+            pointsDeducted: cost,
+            voucherCode,
+            timestamp: admin.firestore.FieldValue.serverTimestamp()
+        });
+    });
+
+    return {
+        success: true,
+        redemptionId: redemptionRef.id,
+        voucherCode,
+        pointsSpent: cost,
+        remainingPoints
+    };
+});
+
+/**
+ * 8. sendNotificationServer
+ * Server-authorized notification dispatcher. Prevents unprivileged clients from broadcasting
+ * fake ROLE: announcements or spamming other employee accounts.
+ */
+exports.sendNotificationServer = secureOnCall({ timeoutSeconds: 30 }, async (request) => {
+    if (!request.auth) {
+        throw new functions.https.HttpsError('unauthenticated', 'Must be authenticated to send notifications.');
+    }
+    const token = request.auth.token || {};
+    if (token.isDisabled === true) {
+        throw new functions.https.HttpsError('permission-denied', 'Account is disabled.');
+    }
+
+    const { targetUserId, message, type, link, metadata, id: clientProvidedId } = request.data || {};
+
+    if (!targetUserId || typeof targetUserId !== 'string' || !targetUserId.trim()) {
+        throw new functions.https.HttpsError('invalid-argument', 'targetUserId is required.');
+    }
+    if (!message || typeof message !== 'string' || !message.trim()) {
+        throw new functions.https.HttpsError('invalid-argument', 'message is required.');
+    }
+
+    const uid = request.auth.uid;
+    const isSuperAdmin = token.isSuperAdmin === true || token.roleId === 'role-super-admin';
+    const isAdmin = isSuperAdmin || token.isAdmin === true || token.type === 'Staff' || !!token.roleId;
+
+    const trimmedTarget = targetUserId.trim();
+
+    // 1. Check broadcast permissions
+    const isBroadcast = trimmedTarget.startsWith('ROLE:') || trimmedTarget === 'all_admins' || trimmedTarget === 'admin';
+
+    if (isBroadcast) {
+        if (trimmedTarget.startsWith('ROLE:') && !isAdmin) {
+            throw new functions.https.HttpsError('permission-denied', 'Only administrators can broadcast role-based notifications.');
+        }
+        // Non-admins can message 'all_admins' or 'admin' (e.g. for support/grievances)
+    } else {
+        // Individual recipient check: Non-admins can only send notifications addressed to themselves or an admin
+        const isSelf = (trimmedTarget === uid || trimmedTarget === token.employeeId || trimmedTarget === token.portalId);
+        if (!isSelf && !isAdmin) {
+            throw new functions.https.HttpsError('permission-denied', 'Non-administrative users cannot send notifications to other users.');
+        }
+    }
+
+    const db = admin.firestore();
+    const notifId = (typeof clientProvidedId === 'string' && clientProvidedId.trim()) ? clientProvidedId.trim() : db.collection('notifications').doc().id;
+
+    const notifDoc = {
+        id: notifId,
+        targetUserId: trimmedTarget,
+        message: message.trim(),
+        type: type || 'info',
+        link: link || null,
+        metadata: metadata || null,
+        read: false,
+        senderId: uid,
+        senderName: token.name || token.email || 'System',
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        timestamp: new Date().toISOString()
+    };
+
+    await db.collection('notifications').doc(notifId).set(notifDoc);
+
+    return {
+        success: true,
+        notificationId: notifId
+    };
+});
+
+/**
+ * 9. completeBgvReviewServer
+ * Server-enforced Background Verification approval, rejection, and atomic employee badge sync.
+ * Prevents clients from spoofing BGV clearance without audited authority.
+ */
+exports.completeBgvReviewServer = secureOnCall({ timeoutSeconds: 60 }, async (request) => {
+    if (!request.auth) {
+        throw new functions.https.HttpsError('unauthenticated', 'Must be authenticated to review BGV.');
+    }
+    const token = request.auth.token || {};
+    if (token.isDisabled === true) {
+        throw new functions.https.HttpsError('permission-denied', 'Account is disabled.');
+    }
+
+    const {
+        recordId,
+        employeeId,
+        action, // 'APPROVE' | 'REJECT'
+        notes,
+        rejectionReason,
+        bgvDocumentUrl,
+        bgvDocumentPath,
+        bgvDocumentName,
+        vendorName,
+        vendorCaseId
+    } = request.data || {};
+
+    if (!recordId || typeof recordId !== 'string') {
+        throw new functions.https.HttpsError('invalid-argument', 'recordId is required.');
+    }
+    if (action !== 'APPROVE' && action !== 'REJECT') {
+        throw new functions.https.HttpsError('invalid-argument', 'action must be "APPROVE" or "REJECT".');
+    }
+
+    const isSuperAdmin = token.isSuperAdmin === true || token.roleId === 'role-super-admin';
+    const permissions = Array.isArray(token.permissions) ? token.permissions : [];
+    const hasBgvPerm = isSuperAdmin ||
+        permissions.includes('BGV_APPROVE_REJECT') ||
+        permissions.includes('BGV_MANAGE');
+
+    if (!hasBgvPerm) {
+        throw new functions.https.HttpsError('permission-denied', 'Missing permission to approve or reject BGV.');
+    }
+
+    const db = admin.firestore();
+    const bgvRef = db.collection('bgv_records').doc(recordId);
+    const bgvSnap = await bgvRef.get();
+
+    if (!bgvSnap.exists) {
+        throw new functions.https.HttpsError('not-found', `BGV record "${recordId}" not found.`);
+    }
+
+    const bgvData = bgvSnap.data();
+    const targetEmpId = employeeId || bgvData.employeeId;
+    const empSnap = await resolveEmployeeDocAdmin(db, targetEmpId);
+
+    const approverName = token.name || token.email || 'Admin';
+    const nowIso = new Date().toISOString();
+    const batch = db.batch();
+
+    let finalStatus = '';
+    let notificationMessage = '';
+
+    if (action === 'APPROVE') {
+        finalStatus = 'Completed';
+        const bgvUpdates = {
+            status: finalStatus,
+            approvedBy: approverName,
+            approvedDate: nowIso,
+            approvedAt: admin.firestore.FieldValue.serverTimestamp(),
+            notes: (notes || bgvData.notes || '').trim(),
+            updatedAt: nowIso
+        };
+        if (bgvDocumentUrl) bgvUpdates.bgvDocumentUrl = bgvDocumentUrl;
+        if (bgvDocumentPath) bgvUpdates.bgvDocumentPath = bgvDocumentPath;
+        if (bgvDocumentName) bgvUpdates.bgvDocumentName = bgvDocumentName;
+        if (vendorName) bgvUpdates.vendorName = vendorName.trim();
+        if (vendorCaseId) bgvUpdates.vendorCaseId = vendorCaseId.trim();
+
+        batch.update(bgvRef, bgvUpdates);
+
+        if (empSnap && empSnap.exists) {
+            batch.update(empSnap.ref, {
+                bgvStatus: finalStatus,
+                bgvCompletedAt: nowIso,
+                bgvNotes: (notes || '').trim(),
+                updatedAt: nowIso
+            });
+        }
+
+        notificationMessage = 'Your Background Verification (BGV) has been verified and marked Completed.';
+    } else {
+        finalStatus = 'Failed';
+        const reason = (rejectionReason || notes || 'Adverse findings').trim();
+        const bgvUpdates = {
+            status: finalStatus,
+            rejectionReason: reason,
+            rejectedBy: approverName,
+            rejectedDate: nowIso,
+            rejectedAt: admin.firestore.FieldValue.serverTimestamp(),
+            notes: `Adverse / Rejected by ${approverName}: ${reason}`,
+            updatedAt: nowIso
+        };
+
+        batch.update(bgvRef, bgvUpdates);
+
+        if (empSnap && empSnap.exists) {
+            batch.update(empSnap.ref, {
+                bgvStatus: finalStatus,
+                bgvNotes: `Adverse / Rejected: ${reason}`,
+                updatedAt: nowIso
+            });
+        }
+
+        notificationMessage = `Your Background Verification (BGV) status was updated: Adverse findings recorded. Reason: ${reason}`;
+    }
+
+    // Direct notification to employee
+    if (empSnap && empSnap.exists) {
+        const notifTarget = empSnap.data().employeeId || empSnap.id;
+        const notifRef = db.collection('notifications').doc();
+        batch.set(notifRef, {
+            id: notifRef.id,
+            targetUserId: notifTarget,
+            message: notificationMessage,
+            type: action === 'APPROVE' ? 'success' : 'error',
+            read: false,
+            senderId: request.auth.uid,
+            senderName: approverName,
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            timestamp: nowIso
+        });
+    }
+
+    // Audit Log
+    const auditRef = db.collection('audit_logs').doc();
+    batch.set(auditRef, {
+        action: action === 'APPROVE' ? 'BGV_APPROVE' : 'BGV_REJECT',
+        category: 'BGV',
+        targetId: recordId,
+        actorId: request.auth.uid,
+        actorEmail: token.email || 'Admin',
+        details: `${approverName} marked BGV for ${targetEmpId || recordId} as "${finalStatus}". Notes/Reason: ${notes || rejectionReason || 'None'}`,
+        timestamp: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    await batch.commit();
+
+    return {
+        success: true,
+        recordId,
+        employeeId: targetEmpId,
+        status: finalStatus
+    };
+});

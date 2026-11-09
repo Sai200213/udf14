@@ -2,7 +2,8 @@ import React, { createContext, useContext, useState, useEffect, useCallback, Rea
 import { v4 as uuidv4 } from 'uuid';
 import { Notification, UserType } from '../../types';
 import { AppView } from '../../App';
-import { db } from '../firebase/config';
+import { db, functions } from '../firebase/config';
+import { httpsCallable } from 'firebase/functions';
 import { collection, doc, query, where, limit, onSnapshot, setDoc, updateDoc, writeBatch, serverTimestamp } from 'firebase/firestore';
 import { useAuth } from '../context/AuthContext';
 
@@ -106,15 +107,28 @@ export const NotificationProvider: React.FC<{ children: ReactNode }> = ({ childr
         // Instant local update
         setNotifications(prev => [newNotif, ...prev.filter(n => n.id !== notifId)]);
 
-        // Persist to Firestore
+        // Persist via secure Cloud Function with fallback
         try {
-            await setDoc(doc(db, 'notifications', notifId), {
-                ...newNotif,
-                createdAt: serverTimestamp()
+            const sendFn = httpsCallable<{ id: string; targetUserId: string; message: string; type: string; link: any }, { success: boolean }>(functions, 'sendNotificationServer');
+            await sendFn({
+                id: notifId,
+                targetUserId,
+                message,
+                type,
+                link: (link || null) as any
             });
-        } catch (err) {
-            console.warn("Failed to persist notification to Firestore:", err);
+        } catch (serverErr) {
+            console.warn("Failed to persist notification via Cloud Function, attempting direct Firestore write:", serverErr);
+            try {
+                await setDoc(doc(db, 'notifications', notifId), {
+                    ...newNotif,
+                    createdAt: serverTimestamp()
+                });
+            } catch (err) {
+                console.warn("Failed to persist notification to Firestore fallback:", err);
+            }
         }
+
     }, []);
 
     const markNotificationAsRead = useCallback(async (id: string) => {

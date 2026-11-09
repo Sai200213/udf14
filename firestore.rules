@@ -391,7 +391,8 @@ service cloud.firestore {
         resource.data.targetUserId == 'ROLE:role-security-guard' ||
         (isAdmin() && resource.data.targetUserId in ['all_admins', 'admin'])
       ));
-      allow create: if isRegisteredUser();
+      // SEC-09: Direct creation restricted to admins; non-admin notifications and role broadcasts route via sendNotificationServer
+      allow create: if isAdmin();
       // SEC-09: Only direct personal notifications can be updated/deleted by users; broadcast (ROLE:) notifications are immutable for non-admins
       allow update, delete: if isAdmin() || (isAuthenticated() && (
         resource.data.targetUserId == request.auth.uid ||
@@ -464,20 +465,21 @@ service cloud.firestore {
       allow create: if isSuperAdmin() || 
                        hasPermission('BGV_MANAGE') || 
                        hasPermission('BGV_DISPATCH_VENDOR');
-      allow update: if isSuperAdmin() || 
-                       hasPermission('BGV_MANAGE') || 
-                       hasPermission('BGV_DISPATCH_VENDOR') || 
-                       hasPermission('BGV_UPLOAD_CERTIFICATE') || 
-                       hasPermission('BGV_APPROVE_REJECT') || 
-                       (isAuthenticated() && resource.data.get('vendorId', '') == request.auth.uid &&
-                        // SEC-06: Vendors can only update vendor notes & reports; forbidden from approving checks
-                        request.resource.data.diff(resource.data).affectedKeys().hasOnly([
-                          'vendorNotes', 'vendorReportURL', 'vendorStatus', 'vendorCompletedAt', 
-                          'vendorDocuments', 'lastUpdated', 'updatedAt'
-                        ]) &&
-                        !request.resource.data.diff(resource.data).affectedKeys().hasAny([
-                          'status', 'result', 'internalStatus', 'approvedBy', 'approvedAt'
-                        ]));
+      // SEC-06: Status changes and approvals strictly handled via Cloud Function (completeBgvReviewServer)
+      allow update: if isSuperAdmin() || (
+        (hasPermission('BGV_MANAGE') || hasPermission('BGV_DISPATCH_VENDOR') || hasPermission('BGV_UPLOAD_CERTIFICATE') || hasPermission('BGV_APPROVE_REJECT')) &&
+        !request.resource.data.diff(resource.data).affectedKeys().hasAny(['status', 'approvedBy', 'approvedDate', 'rejectionReason'])
+      ) || (
+        isAuthenticated() && resource.data.get('vendorId', '') == request.auth.uid &&
+        // SEC-06: Vendors can only update vendor notes & reports; forbidden from approving checks
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'vendorNotes', 'vendorReportURL', 'vendorStatus', 'vendorCompletedAt', 
+          'vendorDocuments', 'lastUpdated', 'updatedAt'
+        ]) &&
+        !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+          'status', 'result', 'internalStatus', 'approvedBy', 'approvedAt'
+        ])
+      );
       allow delete: if isSuperAdmin();
     }
 
@@ -560,7 +562,8 @@ service cloud.firestore {
 
     match /reward_redemptions/{id} {
       allow read: if isAdmin() || (isAuthenticated() && isOwnerOfPortalId(resource.data.userId));
-      allow create: if isAuthenticated() && isOwnerOfPortalId(request.resource.data.userId);
+      // SEC-17: Voucher generation and points verification strictly handled by Cloud Function (redeemRewardServer)
+      allow create: if false;
       allow update, delete: if isAdmin();
     }
 

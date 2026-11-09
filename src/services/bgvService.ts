@@ -1,4 +1,5 @@
-import { db, storage } from '../firebase/config';
+import { db, storage, functions } from '../firebase/config';
+import { httpsCallable } from 'firebase/functions';
 import { 
   collection, 
   doc, 
@@ -367,8 +368,32 @@ export const vendorSubmitBgvReport = async (
 export const staffApproveBgv = async (
   recordId: string, 
   staffName: string, 
-  approvalNotes?: string
+  approvalNotes?: string,
+  employeeId?: string
 ) => {
+  // 1. Server-enforced approval and atomic employee sync
+  try {
+    const completeFn = httpsCallable<{
+      recordId: string;
+      employeeId?: string;
+      action: 'APPROVE' | 'REJECT';
+      notes?: string;
+    }, { success: boolean }>(functions, 'completeBgvReviewServer');
+    const res = await completeFn({
+      recordId,
+      employeeId,
+      action: 'APPROVE',
+      notes: (approvalNotes || '').trim()
+    });
+    if (res.data?.success) {
+      log.log(`[BGV] Server approved BGV for ${recordId}`);
+      return;
+    }
+  } catch (serverErr) {
+    log.warn('[BGV] Server completeBgvReviewServer failed, checking direct fallback:', serverErr);
+  }
+
+  // 2. Fallback to direct Firestore update
   const refDoc = doc(db, BGV_COLLECTION, recordId);
   const updates: Partial<BgvRecord> = {
     status: BgvStatus.COMPLETED,
@@ -396,6 +421,39 @@ export const staffDirectCompleteBgv = async (
   const cleanName = file.name.replace(/[^a-zA-Z0-9._-]/g, '_');
   const storagePath = await uploadFile(file, `employees/${employeeId}/bgv`, `${Date.now()}_${cleanName}`);
 
+  // 1. Server-enforced approval and atomic employee sync
+  try {
+    const completeFn = httpsCallable<{
+      recordId: string;
+      employeeId?: string;
+      action: 'APPROVE' | 'REJECT';
+      notes?: string;
+      bgvDocumentUrl?: string;
+      bgvDocumentPath?: string;
+      bgvDocumentName?: string;
+      vendorName?: string;
+      vendorCaseId?: string;
+    }, { success: boolean }>(functions, 'completeBgvReviewServer');
+    const res = await completeFn({
+      recordId,
+      employeeId,
+      action: 'APPROVE',
+      notes: (notes || '').trim(),
+      bgvDocumentUrl: storagePath,
+      bgvDocumentPath: storagePath,
+      bgvDocumentName: file.name,
+      vendorName: vendorName ? vendorName.trim() : undefined,
+      vendorCaseId: vendorCaseId ? vendorCaseId.trim() : undefined
+    });
+    if (res.data?.success) {
+      log.log(`[BGV] Server direct-completed BGV for ${employeeId} (${recordId})`);
+      return;
+    }
+  } catch (serverErr) {
+    log.warn('[BGV] Server completeBgvReviewServer failed for direct upload, falling back to direct write:', serverErr);
+  }
+
+  // 2. Fallback to direct Firestore update
   const refDoc = doc(db, BGV_COLLECTION, recordId);
   const updates: Partial<BgvRecord> = {
     status: BgvStatus.COMPLETED,
@@ -420,8 +478,34 @@ export const staffDirectCompleteBgv = async (
 export const staffRejectBgv = async (
   recordId: string,
   staffName: string,
-  rejectionReason: string
+  rejectionReason: string,
+  employeeId?: string
 ) => {
+  // 1. Server-enforced rejection and atomic employee sync
+  try {
+    const completeFn = httpsCallable<{
+      recordId: string;
+      employeeId?: string;
+      action: 'APPROVE' | 'REJECT';
+      notes?: string;
+      rejectionReason?: string;
+    }, { success: boolean }>(functions, 'completeBgvReviewServer');
+    const res = await completeFn({
+      recordId,
+      employeeId,
+      action: 'REJECT',
+      notes: rejectionReason.trim(),
+      rejectionReason: rejectionReason.trim()
+    });
+    if (res.data?.success) {
+      log.log(`[BGV] Server rejected/flagged BGV for ${recordId}`);
+      return;
+    }
+  } catch (serverErr) {
+    log.warn('[BGV] Server completeBgvReviewServer failed for rejection, falling back to direct write:', serverErr);
+  }
+
+  // 2. Fallback to direct Firestore update
   const refDoc = doc(db, BGV_COLLECTION, recordId);
   const updates: Partial<BgvRecord> = {
     status: BgvStatus.FAILED,

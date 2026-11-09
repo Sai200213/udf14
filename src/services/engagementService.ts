@@ -1,4 +1,5 @@
-import { db } from '../firebase/config';
+import { db, functions } from '../firebase/config';
+import { httpsCallable } from 'firebase/functions';
 import { 
     doc, 
     getDoc, 
@@ -55,6 +56,18 @@ export const getUserStreak = async (userId: string): Promise<UserStreak | null> 
 };
 
 export const updateOrCreateStreak = async (userId: string, userName: string): Promise<UserStreak & { points?: number }> => {
+    // 1. Prefer secure server-side streak & point calculation (Asia/Kolkata timezone enforced)
+    try {
+        const recordStreakFn = httpsCallable<{ userId: string; userName: string }, { success: boolean; streak: any }>(functions, 'recordDailyStreakServer');
+        const res = await recordStreakFn({ userId, userName });
+        if (res.data?.streak) {
+            log.log(`Server streak recorded for ${userName}: ${res.data.streak.streakCount} days, ${res.data.streak.points} pts`);
+            return res.data.streak;
+        }
+    } catch (serverErr) {
+        log.warn('Server recordDailyStreakServer failed or offline, falling back to local computation:', serverErr);
+    }
+
     const today = getLocalDateString();
     const yesterday = getLocalDateString(-1);
     const docRef = doc(db, 'user_engagement', userId);
@@ -401,6 +414,22 @@ export const createRewardRedemption = async (
     rewardTitle: string,
     pointsSpent: number
 ): Promise<boolean> => {
+    // 1. Prefer atomic server-side verification and voucher issuance
+    try {
+        const redeemFn = httpsCallable<{ userId: string; userName: string; rewardTitle: string; pointsSpent: number }, { success: boolean; voucherCode?: string; remainingPoints?: number }>(functions, 'redeemRewardServer');
+        const res = await redeemFn({ userId, userName, rewardTitle, pointsSpent });
+        if (res.data?.success) {
+            log.log(`Reward redemption created via server for ${userName}: ${rewardTitle} (${pointsSpent} pts, voucher: ${res.data.voucherCode})`);
+            return true;
+        }
+    } catch (serverErr: any) {
+        log.warn('Server redeemRewardServer failed, falling back to local transaction if permitted:', serverErr?.message || serverErr);
+        if (serverErr?.code === 'functions/failed-precondition') {
+            // Insufficient points was strictly rejected by server
+            return false;
+        }
+    }
+
     try {
         const streakRef = doc(db, 'user_engagement', userId);
         const streakSnap = await getDoc(streakRef);

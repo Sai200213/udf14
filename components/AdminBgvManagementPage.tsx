@@ -464,7 +464,8 @@ export const AdminBgvManagementPage: React.FC<AdminBgvManagementPageProps> = ({
       await staffApproveBgv(
         selectedCandidate.id,
         authUser?.name || 'Staff Admin',
-        actionNotesInput.trim()
+        actionNotesInput.trim(),
+        selectedCandidate.employeeId
       );
       if (logAction) {
         logAction('APPROVAL', 'EMPLOYEES', `Approved vendor BGV report for ${selectedCandidate.employeeName}`);
@@ -493,7 +494,8 @@ export const AdminBgvManagementPage: React.FC<AdminBgvManagementPageProps> = ({
       await staffRejectBgv(
         selectedCandidate.id,
         authUser?.name || 'Staff Admin',
-        rejectionReasonInput.trim()
+        rejectionReasonInput.trim(),
+        selectedCandidate.employeeId
       );
       if (logAction) {
         logAction('REJECTION', 'EMPLOYEES', `Flagged BGV adverse/failed for ${selectedCandidate.employeeName}: ${rejectionReasonInput}`);
