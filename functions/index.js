@@ -2678,7 +2678,7 @@ exports.autoDeleteRecycleBin = onSchedule({
 
         // Query expired items in /recycle_bin (UDF13-13)
         if (deletedCount < maxAllowedDeletes) {
-            const expiredBinSnap = await db.collection('recycle_bin').where('autoPurgeAt', '<=', thirtyDaysAgoIso).get();
+            const expiredBinSnap = await db.collection('recycle_bin').where('deletedAt', '<=', thirtyDaysAgoIso).get();
             for (const binDoc of expiredBinSnap.docs) {
                 if (deletedCount >= maxAllowedDeletes) break;
                 await binDoc.ref.delete().catch(() => {});
@@ -5950,7 +5950,8 @@ exports.completeTrainingQuizServer = secureOnCall(async (request) => {
     }
 
     batch.set(logRef, {
-        userId: uid,
+        userId: targetDocId,
+        userUid: uid,
         type: 'QUIZ',
         questionId: questionId || 'daily_safety_quiz',
         selectedAnswer,
@@ -7829,22 +7830,26 @@ exports.redeemRewardServer = secureOnCall({ timeoutSeconds: 30 }, async (request
     }
 
     // Server-side reward cost verification against gamification_rules (UDF13-02)
-    let verifiedCost = cost;
-    try {
-        const rulesSnap = await db.collection('settings').doc('gamification_rules').get();
-        if (rulesSnap.exists) {
-            const rulesData = rulesSnap.data() || {};
-            const rewardsList = Array.isArray(rulesData.rewards) ? rulesData.rewards : [];
-            const matchedReward = rewardsList.find(r => r && (
-                (r.id && r.id === request.data.rewardId) ||
-                (r.title && r.title.trim().toLowerCase() === rewardTitle.trim().toLowerCase())
-            ));
-            if (matchedReward && matchedReward.pointsCost !== undefined) {
-                verifiedCost = Number(matchedReward.pointsCost);
-            }
-        }
-    } catch (rulesErr) {
-        console.warn('[redeemRewardServer] Could not verify reward price against gamification_rules:', rulesErr);
+    const defaultRewards = [
+        { id: 'cap', name: 'UDF Branded Security Cap', cost: 300 },
+        { id: 'bottle', name: 'Stainless Steel Water Bottle', cost: 500 },
+        { id: 'jacket', name: 'Premium Warm Winter Jacket', cost: 1200 }
+    ];
+    const rulesSnap = await db.collection('settings').doc('gamification_rules').get();
+    const rulesData = rulesSnap.exists ? (rulesSnap.data() || {}) : {};
+    const rewardsList = (Array.isArray(rulesData.rewards) && rulesData.rewards.length > 0)
+        ? rulesData.rewards
+        : defaultRewards;
+    const matchedReward = rewardsList.find(r => r && (
+        (r.id && r.id === request.data.rewardId) ||
+        ((r.name || r.title || '').trim().toLowerCase() === rewardTitle.trim().toLowerCase())
+    ));
+    if (!matchedReward) {
+        throw new functions.https.HttpsError('not-found', `Reward "${rewardTitle.trim()}" is not in the active rewards catalog.`);
+    }
+    const verifiedCost = Number(matchedReward.cost ?? matchedReward.pointsCost);
+    if (!Number.isInteger(verifiedCost) || verifiedCost <= 0) {
+        throw new functions.https.HttpsError('failed-precondition', 'Invalid reward cost configuration.');
     }
 
     const engagementRef = db.collection('user_engagement').doc(targetDocId);
@@ -7945,34 +7950,30 @@ exports.sendNotificationServer = secureOnCall({ timeoutSeconds: 30 }, async (req
     const isAdmin = isSuperAdmin || token.isAdmin === true || token.type === 'Staff' || !!token.roleId;
 
     const trimmedTarget = targetUserId.trim();
+    const db = admin.firestore();
 
     // 1. Check broadcast permissions
     const isBroadcast = trimmedTarget.startsWith('ROLE:') || trimmedTarget === 'all_admins' || trimmedTarget === 'admin';
 
-    // Allow non-admins to send notifications if it is an official workflow notification (UDF13-09)
-    const isWorkflowNotification = metadata && (
-        metadata.module === 'LEAVES' ||
-        metadata.module === 'ACCOUNT_UPDATES' ||
-        metadata.module === 'RESIGNATIONS' ||
-        metadata.module === 'ONBOARDING' ||
-        metadata.module === 'SUBMISSIONS' ||
-        metadata.isWorkflow === true
-    );
-
     if (isBroadcast) {
-        if (trimmedTarget.startsWith('ROLE:') && !isAdmin && !isWorkflowNotification) {
+        const isEmployeeBroadcast = trimmedTarget === 'ROLE:employee' || trimmedTarget === 'ROLE:role-security-guard';
+        if (isEmployeeBroadcast && !isAdmin) {
             throw new functions.https.HttpsError('permission-denied', 'Only administrators can broadcast role-based notifications.');
         }
         // Non-admins can message 'all_admins', 'admin', or workflow roles
     } else {
         // Individual recipient check: Non-admins can send notifications addressed to themselves, an admin, or workflow approver
         const isSelf = (trimmedTarget === uid || trimmedTarget === token.employeeId || trimmedTarget === token.portalId);
-        if (!isSelf && !isAdmin && !isWorkflowNotification) {
-            throw new functions.https.HttpsError('permission-denied', 'Non-administrative users cannot send notifications to other users.');
+        if (!isSelf && !isAdmin) {
+            const [staffSnap, userSnap] = await Promise.all([
+                db.collection('staff_accounts').doc(trimmedTarget).get(),
+                db.collection('users').doc(trimmedTarget).get()
+            ]);
+            if (!staffSnap.exists && !userSnap.exists) {
+                throw new functions.https.HttpsError('permission-denied', 'Non-administrative users cannot send notifications to other employees.');
+            }
         }
     }
-
-    const db = admin.firestore();
     const notifId = (typeof clientProvidedId === 'string' && clientProvidedId.trim()) ? clientProvidedId.trim() : db.collection('notifications').doc().id;
 
     const notifDoc = {
@@ -8037,6 +8038,7 @@ exports.completeBgvReviewServer = secureOnCall({ timeoutSeconds: 60 }, async (re
         permissions.includes('BGV_APPROVE_REJECT') ||
         permissions.includes('BGV_MANAGE');
 
+    const db = admin.firestore();
     if (!hasBgvPerm) {
         const saSnap = await db.collection('staff_accounts').doc(request.auth.uid).get();
         const saData = saSnap.exists ? saSnap.data() : null;
@@ -8054,7 +8056,6 @@ exports.completeBgvReviewServer = secureOnCall({ timeoutSeconds: 60 }, async (re
         }
     }
 
-    const db = admin.firestore();
     const bgvRef = db.collection('bgv_records').doc(recordId);
     const bgvSnap = await bgvRef.get();
 
